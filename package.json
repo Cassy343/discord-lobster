@@ -1,0 +1,16 @@
+{
+  "name": "discord-lobster",
+  "version": "1.0.0",
+  "description": "A discord bot for running C++ code",
+  "main": "index.js",
+  "author": "Cassy343 <isilversmith810@gmail.com>",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p ."
+  },
+  "dependencies": {
+    "child_process": "^1.0.2",
+    "discord.js": "^13.3.1",
+    "util": "^0.12.4"
+  }
+}

@@ -1,0 +1,17 @@
+#include <algorithm>
+#include <sstream>
+#include <iomanip>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <limits>
+#include <map>
+#include <list>
+#include <array>
+
+using namespace std;
+
+int main(int argc, char *argv[]) {
+    %CODE
+    return 0;
+}
