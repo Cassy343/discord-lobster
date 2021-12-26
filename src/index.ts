@@ -1,8 +1,5 @@
-const { Client, Intents } = require("discord.js");
+import { Client, Intents, Message, PartialMessage } from "discord.js";
 import { readFile, writeFile, unlink } from "fs/promises";
-import { promisify } from "util";
-const exec = promisify(require('child_process').exec);
-import { asciiify, sanitizeOutput } from "./sanitize";
 import { SandboxStore } from "./sandbox";
 
 const client = new Client({
@@ -15,100 +12,76 @@ const sandboxes = new SandboxStore();
 
 const PREFIX: string = '?';
 
-async function destroyContainer(id: string, silent: boolean) {
-    await exec(`docker kill ${id}`).catch(() => {
-        if (!silent) console.log(`Failed to kill container ${id}`)
-    });
-    await exec(`docker rm -f ${id}`).catch(() => {
-        if (!silent) console.log(`Failed to remove container ${id}`)
-    });
-}
+function sanitizeOutput(output: string): string {
+    output = Array.from(output.replace(/[^\x20-\x7F\n]/g, '')).filter(char => char != '`').join('').trim();
 
-async function execAndCaptureOutput(command: string) {
-    let stdio;
-    try {
-        stdio = await exec(command);
-    } catch (error) {
-        stdio = {
-            stdout: error.stdout,
-            stderr: error.stderr
-        };
+    if (!output) {
+        return '';
     }
-    return stdio;
+
+    output = '```cpp\n' + output + '\n```';
+
+    if (output.length > 800) {
+        output = 'Full output too long to display.\n' + output.substring(0, 800).trim() + '\n```';
+    }
+
+    let i = 0;
+    let newLineCount = 0;
+
+    for (; i < output.length && newLineCount < 30; ++i) {
+        if (output.charAt(i) == '\n') {
+            newLineCount += 1;
+        }
+    }
+
+    if (i < output.length) {
+        output = output.substring(0, i).trim() + '\n```';
+    }
+
+    return output;
 }
 
 async function runTemplate(
     sandboxId: string,
+    containerId: string,
     code: string,
-    template: string,
     command: (file: string) => string
 ) {
-    if (code.includes('#')) {
-        await sandboxes.sendSandboxOutput(
-            sandboxId,
-            'You cannot include additional headers in your code. Due to the complexity of C++, ' +
-            'this means that you cannot include the \'#\' character in your code.'
-        );
-        return;
-    }
-
-    template = (await readFile(template)).toString();
-    code = template.replace('%CODE', code);
     let fileName = 'main-' + (new Date()).getTime();
     let sourceFile = fileName + '.cpp';
     let objectFile = fileName + '.o';
     let containerName = `exec-${fileName}`;
     
     await writeFile(sourceFile, code);
-
-    let dockerCmd = [
-        'docker', 'run',
-        `--name=${containerName}`,
-        '-i', // Interactive mode
-        '-t', // Allocate pseudo TTY
-        '-d', // Detached
-        '--pids-limit', '512',
-        '--memory', '256000000',
-        '--memory-swap', '256000000',
-        '--net', 'none',
-        '--entrypoint=\"\"',
-        process.env.DOCKER_IMAGE,
-        '/bin/bash'
-    ];
-
-    let stdio;
-    stdio = await exec(dockerCmd.join(' '));
-
-    if (stdio.stderr) {
-        console.log('Failed to start docker container');
-        return;
-    }
-
-    await sandboxes.setContainerId(sandboxId, containerName);
-
-    await exec(`docker cp ${sourceFile} ${containerName}:/usr/src/`);
+    await sandboxes.copySourceFile(sandboxId, containerId, sourceFile);
     await unlink(sourceFile);
 
-    setTimeout(() => {
-        destroyContainer(containerName, true);
-    }, 5000);
+    sandboxes.startDestroyTimout(sandboxId, containerId);
 
-    stdio = await execAndCaptureOutput(
-        `docker exec ${containerName} g++ /usr/src/${sourceFile} -o /usr/src/${objectFile}`
-        );
+    let stdio = await sandboxes.execInContainer(
+        sandboxId,
+        containerId,
+        `g++ /usr/src/${sourceFile} -o /usr/src/${objectFile}`
+    );
 
-    if (stdio.stderr) {
-        await sandboxes.sendSandboxOutput(
+    if (!stdio) return;
+    else if (stdio.stderr) {
+        await sandboxes.sendOuput(
             sandboxId,
+            containerId,
             `Compilation failed. ${sanitizeOutput(stdio.stderr)}`
         );
         return;
     }
     
-    stdio = await execAndCaptureOutput(
-        `docker exec ${containerName} ${command(`/usr/src/${objectFile}`)}`
+    stdio = await sandboxes.execInContainer(
+        sandboxId,
+        containerId,
+        `${command(`/usr/src/${objectFile}`)}`
     );
-    destroyContainer(containerName, false);
+    if (!stdio) return;
+
+    await sandboxes.destroyContainer(sandboxId, containerId);
 
     let message;
     if (stdio.stderr) {
@@ -120,7 +93,7 @@ async function runTemplate(
     }
 
     message = message ? message : 'No output';
-    await sandboxes.sendSandboxOutput(sandboxId, message);
+    await sandboxes.sendOuput(sandboxId, containerId, message);
 }
 
 function determinePlayTemplate(code: string): string {
@@ -135,19 +108,41 @@ function determinePlayTemplate(code: string): string {
     return template;
 }
 
-async function play(sandboxId: string, code: string) {
-    await runTemplate(sandboxId, code, determinePlayTemplate(code), file => file);
+async function applyTemplate(code: string, templateFile: string): Promise<string> {
+    let template = (await readFile(templateFile)).toString();
+    return template.replace('%CODE', code);
 }
 
-async function cppEval(sandboxId: string, code: string) {
-    await runTemplate(sandboxId, code, 'eval.cpp.template', file => file);
+async function play(sandboxId: string, containerId: string, code: string) {
+    let template = determinePlayTemplate(code);
+    await runTemplate(
+        sandboxId,
+        containerId,
+        await applyTemplate(code, template),
+        file => file
+    );
 }
 
-async function valgrind(sandboxId: string, code: string) {
-    await runTemplate(sandboxId, code, determinePlayTemplate(code), file => `valgrind ${file}`);
+async function cppEval(sandboxId: string, containerId: string, code: string) {
+    await runTemplate(
+        sandboxId,
+        containerId,
+        await applyTemplate(code, 'eval.cpp.template'),
+        file => file
+    );
 }
 
-function isolateCode(sandboxId, commandLength: number, messageContent: string): string {
+async function valgrind(sandboxId: string, containerId: string, code: string) {
+    let template = determinePlayTemplate(code);
+    await runTemplate(
+        sandboxId,
+        containerId,
+        await applyTemplate(code, template),
+        file => `valgrind ${file}`
+    );
+}
+
+function isolateCode(commandLength: number, messageContent: string): string {
     messageContent = messageContent.substring(commandLength).trim();
     
     if (
@@ -160,70 +155,83 @@ function isolateCode(sandboxId, commandLength: number, messageContent: string): 
     } else if (messageContent.startsWith('`') && messageContent.endsWith('`')) {
         return messageContent.substring(1, messageContent.length - 1).trim();
     } else {
-        sandboxes.sendSandboxOutput(
-            sandboxId,
-            'Missing code block. Try wrapping your code with \\`...\\` or ' +
-            '\\`\\`\\`cpp ... \\`\\`\\`.'
-        );
-        return null;
+        throw new Error();
     }
 }
 
-async function parseCommand(message, newMessage) {
-    let mostRecent = newMessage ? newMessage : message;
-    let content: string = mostRecent.content;
-
-    if (!content.startsWith(PREFIX)) {
+async function parseCommand(
+    content: string,
+    inputMessage: Message | PartialMessage,
+    transferOutput: (oldMessage: Message | PartialMessage) => boolean
+) {
+    if (!content.startsWith(PREFIX) || !inputMessage.author) {
         return;
     }
 
-    content = asciiify(content.substring(1));
+    content = Array.from(content.substring(1).replace(/[^\x20-\x7F\n]/g, "")).join('');
 
-    let authorId = message.author.id;
-    let oldContainer = sandboxes.getSandbox(authorId, mostRecent, message.id);
-
-    if (oldContainer) {
-        destroyContainer(oldContainer, true);
-    }
+    let id = inputMessage.author.id;
+    let containerId = await sandboxes.newSandbox(id, inputMessage, transferOutput);
 
     let code: string;
     let evaluator;
 
-    if (content.startsWith('play')) {
-        code = isolateCode(authorId, 4, content);
-        evaluator = play;
-    } else if (content.startsWith('eval')) {
-        code = isolateCode(authorId, 4, content);
-        evaluator = cppEval;
-    } else if (content.startsWith('valgrind')) {
-        code = isolateCode(authorId, 8, content);
-        evaluator = valgrind;
-    } else {
+    try {
+        if (content.startsWith('play')) {
+            code = isolateCode(4, content);
+            evaluator = play;
+        } else if (content.startsWith('eval')) {
+            code = isolateCode(4, content);
+            evaluator = cppEval;
+        } else if (content.startsWith('valgrind')) {
+            code = isolateCode(8, content);
+            evaluator = valgrind;
+        } else {
+            return;
+        }
+    } catch (error: any) {
+        sandboxes.sendOuput(
+            id,
+            containerId,
+            'Missing code block. Try wrapping your code with \\`...\\` or ' +
+                '\\`\\`\\`cpp ... \\`\\`\\`.'
+        );
         return;
     }
 
-    if (!code) {
+    if (content.includes('#')) {
+        await sandboxes.sendOuput(
+            id,
+            containerId,
+            'You cannot include additional headers in your code. Due to the complexity of C++, ' +
+            'this means that you cannot include the \'#\' character in your code.'
+        );
         return;
     }
 
-    await evaluator(authorId, code);
+    await evaluator(id, containerId, code);
 }
 
 client.on("ready", () => {
+    if (client.user == null) {
+        console.error("Client user is null");
+        return;
+    }
+
     console.log(`Logged in as ${client.user.tag}!`)
 });
 
 client.on("messageCreate", async msg => {
-    await parseCommand(msg, null)
+    await parseCommand(msg.content, msg, _ => false)
         .catch(error => console.log(`Failed to parse command: ${error}`));
 });
 
 client.on('messageUpdate', async (oldMessage, newMessage) => {
-    if (!sandboxes.isSandboxActive(oldMessage.author.id)) {
+    if (!newMessage.content) {
         return;
     }
 
-    await parseCommand(oldMessage, newMessage)
+    await parseCommand(newMessage.content, newMessage, (msg: Message | PartialMessage) => msg.id === oldMessage.id)
         .catch(error => console.log(`Failed to parse command: ${error}`));
 });
 

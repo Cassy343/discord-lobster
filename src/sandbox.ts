@@ -1,92 +1,183 @@
+import { Message, PartialMessage } from "discord.js";
+import child_process from 'child_process';
+import { promisify } from "util";
+const exec = promisify(child_process.exec);
+
 const SANDBOX_TIMEOUT = 60000; // 60 seconds
+const CONTAINER_TIMOUT = 5000;
 
 function now(): number {
     return (new Date()).getTime();
 }
 
 export class SandboxStore {
-    sandboxes: Map<string, Sandbox>;
+    sandboxes: { [key: string]: Sandbox };
 
     constructor() {
-        this.sandboxes = new Map();
+        this.sandboxes = {};
     }
 
-    getSandbox(creatorId: string, inputMessage, oldMessageId): string {
+    public async newSandbox(
+        id: string,
+        inputMessage: Message | PartialMessage,
+        transferOutput: (oldMessage: Message | PartialMessage) => boolean
+    ): Promise<string> {
         this.cleanSandboxes();
-        let box = this.sandboxes.get(creatorId);
 
-        if (box) {
-            let currentTime = now();
-            if (currentTime - box.lastUpdated > SANDBOX_TIMEOUT) {
-                this.sandboxes.set(creatorId, new Sandbox(inputMessage));
-            } else {
-                if (box.inputMessage.id !== oldMessageId) {
-                    this.sandboxes.set(creatorId, new Sandbox(inputMessage));
-                } else {
-                    box.lastUpdated = now();
-                    box.inputMessage = inputMessage;
-                }
-                return box.dockerContainerId;
+        let oldBox = this.sandboxes[id];
+        let newBox = new Sandbox(inputMessage);
+        await newBox.prepare();
+
+        if (oldBox) {
+            await oldBox.destroy(true);
+            if (transferOutput(oldBox.inputMessage)) {
+                newBox.outputMessage = oldBox.outputMessage;
             }
-        } else {
-            this.sandboxes.set(creatorId, new Sandbox(inputMessage));
         }
 
-        return null;
+        this.sandboxes[id] = newBox;
+        return newBox.containerId;
     }
 
-    isSandboxActive(sandboxId: string) {
-        let box = this.sandboxes.get(sandboxId);
-        return box && now() - box.lastUpdated < SANDBOX_TIMEOUT;
+    public async sendOuput(id: string, containerId: string, output: string): Promise<void> {
+        let box = this.getSandbox(id, containerId);
+        if (!box) return new Promise(() => {});
+        return box.sendOuput(output);
     }
 
-    setContainerId(sandboxId: string, containerId: string) {
-        let box = this.sandboxes.get(sandboxId);
-        if (box) {
-            box.lastUpdated = now();
-            box.dockerContainerId = containerId;
-        }
+    public copySourceFile(id: string, containerId: string, file: string): Promise<void> {
+        let box = this.getSandbox(id, containerId);
+        if (!box) return new Promise(() => {});
+        return box.copySourceFile(file);
     }
 
-    async sendSandboxOutput(sandboxId: string, message: string) {
-        let box = this.sandboxes.get(sandboxId);
+    public async destroyContainer(id: string, containerId: string): Promise<void> {
+        let box = this.getSandbox(id, containerId);
+        if (box) return box.destroy(false);
+        else return new Promise(() => {});
+    }
+
+    public startDestroyTimout(id: string, containerId: string) {
+        let box = this.getSandbox(id, containerId);
         if (!box) return;
-        box.lastUpdated = now();
 
-        if (box.outputMessage) {
-            box.outputMessage.edit(message).catch(console.error);
+        setTimeout(() => {
+            box?.destroy(true);
+        }, CONTAINER_TIMOUT);
+    }
+
+    public execInContainer(id: string, containerId: string, command: string): Promise<{stdout: string, stderr: string} | null> {
+        let box = this.getSandbox(id, containerId);
+        if (!box) return new Promise(() => null);
+        return box.execInContainer(command);
+    }
+
+    public activeContainerId(id: string, inputMessageId: string): string | null {
+        let box = this.sandboxes[id];
+        if (box && now() - box.lastUpdated < SANDBOX_TIMEOUT && box.inputMessage.id == inputMessageId) {
+            box.lastUpdated = now();
+            return box.containerId;
         } else {
-            box.outputMessage = await box.inputMessage.channel.send(message).catch(console.error);
+            return null;
         }
     }
 
-    cleanSandboxes() {
+    private cleanSandboxes() {
         let currentTime = now();
-        for (let id of this.sandboxes.keys()) {
-            if (currentTime - this.sandboxes.get(id).lastUpdated > SANDBOX_TIMEOUT) {
-                this.sandboxes.delete(id);
+        Object.keys(this.sandboxes).forEach(id => {
+            if (currentTime - this.sandboxes[id].lastUpdated > SANDBOX_TIMEOUT) {
+                delete this.sandboxes[id];
             }
-        }
+        });
+    }
+
+    private getSandbox(id: string, containerId: string): Sandbox | null {
+        let box = this.sandboxes[id];
+        if (!box || box.containerId !== containerId) return null;
+        box.lastUpdated = now();
+        return box;
     }
 }
 
 class Sandbox {
+    containerId: string;
     lastUpdated: number;
-    inputMessage;
-    outputMessage;
-    dockerContainerId: string;
+    inputMessage: Message | PartialMessage;
+    outputMessage: Message | null;
+    dockerContainerId: string | null;
 
-    constructor(inputMessage) {
-        this.lastUpdated = now();
+    constructor(inputMessage: Message | PartialMessage) {
+        let currentTime = now();
+        this.containerId = `sandbox-${currentTime}`;
+        this.lastUpdated = currentTime;
         this.inputMessage = inputMessage;
         this.outputMessage = null;
         this.dockerContainerId = null;
     }
 
-    setContainerId(id: string): string {
-        this.lastUpdated = now();
-        let oldId = this.dockerContainerId;
-        this.dockerContainerId = id;
-        return oldId;
+    async prepare() {
+        let dockerCmd = [
+            'docker', 'run',
+            `--name=${this.containerId}`,
+            '-i', // Interactive mode
+            '-t', // Allocate pseudo TTY
+            '-d', // Detached
+            '--pids-limit', '512',
+            '--memory', '256000000',
+            '--memory-swap', '256000000',
+            '--net', 'none',
+            '--entrypoint=\"\"',
+            process.env.DOCKER_IMAGE,
+            '/bin/bash'
+        ];
+    
+        let stdio = await exec(dockerCmd.join(' '));
+    
+        if (stdio.stderr) {
+            console.log('Failed to start docker container');
+        }
+    }
+
+    async sendOuput(output: string) {
+        if (this.outputMessage) {
+            await this.outputMessage.edit(output).catch(console.error);
+        } else {
+            this.outputMessage = await this.inputMessage.channel.send(output).catch(
+                error => {
+                    console.error(error);
+                    return null;
+                }
+            );
+        }
+    }
+
+    async destroy(silent: boolean) {
+        await exec(`docker kill ${this.containerId}`).catch(() => {
+            if (!silent) console.log(`Failed to kill container ${this.containerId}`)
+        });
+
+        await exec(`docker rm -f ${this.containerId}`).catch(() => {
+            if (!silent) console.log(`Failed to remove container ${this.containerId}`)
+        });
+    }
+
+    async copySourceFile(localSource: string) {
+        let stdio = await exec(`docker cp ${localSource} ${this.containerId}:/usr/src`);
+        if (stdio.stderr) {
+            throw new Error(stdio.stderr);
+        }
+    }
+
+    async execInContainer(command: string): Promise<{stdout: string, stderr: string}> {
+        let stdio;
+        try {
+            stdio = await exec(`docker exec ${this.containerId} ${command}`);
+        } catch (error: any) {
+            stdio = {
+                stdout: error.stdout,
+                stderr: error.stderr
+            };
+        }
+        return stdio;
     }
 }
