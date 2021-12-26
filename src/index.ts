@@ -41,7 +41,7 @@ function sanitizeOutput(output: string): string {
     return output;
 }
 
-async function runTemplate(
+async function executeCode(
     sandboxId: string,
     containerId: string,
     code: string,
@@ -93,7 +93,7 @@ async function runTemplate(
     }
 
     message = message ? message : 'No output';
-    await sandboxes.sendOuput(sandboxId, containerId, message);
+    return sandboxes.sendOuput(sandboxId, containerId, message);
 }
 
 function determinePlayTemplate(code: string): string {
@@ -115,7 +115,7 @@ async function applyTemplate(code: string, templateFile: string): Promise<string
 
 async function play(sandboxId: string, containerId: string, code: string) {
     let template = determinePlayTemplate(code);
-    await runTemplate(
+    return executeCode(
         sandboxId,
         containerId,
         await applyTemplate(code, template),
@@ -124,7 +124,7 @@ async function play(sandboxId: string, containerId: string, code: string) {
 }
 
 async function cppEval(sandboxId: string, containerId: string, code: string) {
-    await runTemplate(
+    return executeCode(
         sandboxId,
         containerId,
         await applyTemplate(code, 'eval.cpp.template'),
@@ -134,7 +134,7 @@ async function cppEval(sandboxId: string, containerId: string, code: string) {
 
 async function valgrind(sandboxId: string, containerId: string, code: string) {
     let template = determinePlayTemplate(code);
-    await runTemplate(
+    return executeCode(
         sandboxId,
         containerId,
         await applyTemplate(code, template),
@@ -159,7 +159,7 @@ function isolateCode(commandLength: number, messageContent: string): string {
     }
 }
 
-async function parseCommand(
+async function runCommand(
     content: string,
     inputMessage: Message | PartialMessage,
     transferOutput: (oldMessage: Message | PartialMessage) => boolean
@@ -199,7 +199,7 @@ async function parseCommand(
         return;
     }
 
-    if (content.includes('#')) {
+    if (code.includes('#')) {
         await sandboxes.sendOuput(
             id,
             containerId,
@@ -209,7 +209,7 @@ async function parseCommand(
         return;
     }
 
-    await evaluator(id, containerId, code);
+    return evaluator(id, containerId, code);
 }
 
 client.on("ready", () => {
@@ -221,17 +221,17 @@ client.on("ready", () => {
     console.log(`Logged in as ${client.user.tag}!`)
 });
 
-client.on("messageCreate", async msg => {
-    await parseCommand(msg.content, msg, _ => false)
+client.on("messageCreate", msg => {
+    return runCommand(msg.content, msg, _ => false)
         .catch(error => console.log(`Failed to parse command: ${error}`));
 });
 
-client.on('messageUpdate', async (oldMessage, newMessage) => {
+client.on('messageUpdate', (oldMessage, newMessage) => {
     if (!newMessage.content) {
         return;
     }
 
-    await parseCommand(newMessage.content, newMessage, (msg: Message | PartialMessage) => msg.id === oldMessage.id)
+    return runCommand(newMessage.content, newMessage, (msg: Message | PartialMessage) => msg.id === oldMessage.id)
         .catch(error => console.log(`Failed to parse command: ${error}`));
 });
 
