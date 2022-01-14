@@ -127,6 +127,8 @@ class Sandbox {
             '--memory-swap', '256000000',
             '--net', 'none',
             '--entrypoint=\"\"',
+            '--cap-drop', 'all',
+            '--security-opts', 'no-new-privileges',
             process.env.DOCKER_IMAGE,
             '/bin/bash'
         ];
