@@ -128,7 +128,9 @@ class Sandbox {
             '--net', 'none',
             '--entrypoint=\"\"',
             '--cap-drop', 'all',
-            '--security-opts', 'no-new-privileges',
+            '--security-opt', 'no-new-privileges',
+            '--read-only',
+            '--tmpfs', '/usr/src',
             process.env.DOCKER_IMAGE,
             '/bin/bash'
         ];
